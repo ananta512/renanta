@@ -1,96 +1,93 @@
 /**
- * server.js – WebSocket-to-TCP proxy for browser-based miners
- * CommonJS version (uses require) so it runs without `"type":"module"`.
- * listens on process.env.PORT (Render/Heroku) or 8080 locally.
+ * server.js – WebSocket-to-TCP proxy for browser / JS miners
  *
- * Usage from a miner:
- *   const target   = 'power2b.na.mine.zpool.ca:6242';
- *   const b64      = btoa(target);  // "cG93ZXIyYi5uYS5t..."
- *   const wsUrl    = `wss://proxy.example.com/${b64}`;
- *   connect(wsUrl);
+ *  • Each client connects to:   wss://host/<base64(host:port)>
+ *  • Proxy decodes host:port, opens a raw TCP socket, and pipes data.
+ *  • Incoming TCP data is split on '\n' so every WebSocket TEXT frame
+ *    contains exactly one Stratum JSON message.
+ *
+ * Tested on Node 18+ (CommonJS).  Works on Render, Heroku, Koyeb, Fly.io,
+ * or local Windows/Linux.
  */
 
+/* ────────────────── imports ────────────────── */
 const http      = require('http');
 const net       = require('net');
 const WebSocket = require('ws');
 const { Buffer } = require('buffer');
 
-// ----------------- configuration -----------------
-const LISTEN_PORT = process.env.PORT || 8080;   // Render/Heroku inject PORT
-const KEEPALIVE_MS = 15_000;                    // WebSocket ping interval
-// -------------------------------------------------
+/* ────────────────── config ─────────────────── */
+const PORT         = process.env.PORT || 8080;   // Render injects PORT
+const KEEPALIVE_MS = 15_000;                     // ping interval
+/* ───────────────────────────────────────────── */
 
-// Tiny HTTP surface so browser GET / returns 200 (helps Render health-check)
+/* Tiny HTTP endpoint so platform health-checks pass */
 const httpServer = http.createServer((_, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Mining proxy online\n');
 });
-httpServer.listen(LISTEN_PORT, '0.0.0.0', () =>
-  console.log(`[proxy] listening on ${LISTEN_PORT}`)
+httpServer.listen(PORT, '0.0.0.0', () =>
+  console.log(`[proxy] listening on ${PORT}`)
 );
 
-// WebSocket server – disable compression (no benefit for small stratum JSON)
+/* WebSocket server (compression off) */
 const wss = new WebSocket.Server({
   server: httpServer,
   perMessageDeflate: false
 });
 
 wss.on('connection', (ws, req) => {
-  const urlPath = req.url?.replace('/', '') || '';
+  /* ────────── decode target pool ────────── */
+  const path   = req.url?.replace('/', '') || '';
   let decoded;
-  try {
-    decoded = Buffer.from(urlPath, 'base64').toString('utf8'); // host:port
-  } catch (_e) {
-    ws.close(1008, 'Bad base64 in URL');
-    return;
-  }
+  try { decoded = Buffer.from(path, 'base64').toString('utf8'); }
+  catch { ws.close(1008, 'bad base64'); return; }
+
   const [host, portStr] = decoded.split(':');
   const port = Number(portStr);
-  if (!host || !port) {
-    ws.close(1008, 'URL must encode host:port');
-    return;
-  }
+  if (!host || !port) { ws.close(1008, 'need host:port'); return; }
+
   console.log(`[proxy] ${req.socket.remoteAddress} → ${host}:${port}`);
 
-  // Open TCP to mining pool
+  /* ────────── open TCP to pool ────────── */
   const tcp = net.connect({ host, port }, () =>
     console.log(`[proxy] TCP connected ${host}:${port}`)
   );
 
-  // Relay WebSocket → TCP (ensure newline)
-  ws.on('message', (data) => {
+  /* ────────── POOL ➜ WS  (newline-framed) ────────── */
+  let rest = '';
+  tcp.on('data', chunk => {
+    const str   = rest + chunk.toString('utf8');
+    const msgs  = str.split('\n');
+    rest        = msgs.pop();          // save last (maybe incomplete) part
+    msgs.forEach(m => {
+      if (!m) return;
+      console.log('[POOL ]', m.trim());
+      if (ws.readyState === WebSocket.OPEN) ws.send(m);   // TEXT frame
+    });
+  });
+  tcp.on('end', () => { if (rest && ws.readyState === WebSocket.OPEN) ws.send(rest); });
+
+  /* ────────── WS ➜ TCP  (ensure newline) ────────── */
+  ws.on('message', data => {
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-    tcp.write(buf.slice(-1)[0] === 0x0a ? buf : Buffer.concat([buf, Buffer.from('\n')]));
+    console.log('[MINER]', buf.toString().trim());
+    tcp.write(buf.slice(-1)[0] === 0x0a ? buf
+                                        : Buffer.concat([buf, Buffer.from('\n')]));
   });
 
-  // Relay TCP → WebSocket (as binary) –  trust upstream to send JSON lines
-  tcp.on('data', (chunk) => {
-    if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
-  });
-
-  // Shared close handler
-  const shutdown = (why) => {
+  /* ────────── tidy-up on either side close/error ────────── */
+  const closeAll = why => {
     console.log('[proxy] closing –', why);
     tcp.destroy();
     if (ws.readyState === WebSocket.OPEN) ws.close();
   };
-  ws .on('close', ()       => shutdown('ws closed'));
-  ws .on('error', (e)      => shutdown('ws error '   + e.code));
-  tcp.on('close', ()       => shutdown('tcp closed'));
-  tcp.on('error', (e)      => shutdown('tcp error '  + e.code));
+  ws .on('close', ()  => closeAll('ws closed'));
+  ws .on('error', e   => closeAll('ws error '  + e.code));
+  tcp.on('close', ()  => closeAll('tcp closed'));
+  tcp.on('error', e   => closeAll('tcp error ' + e.code));
 
-  // Keep-alive pings so Render/Heroku/Koyeb won’t idle the socket
+  /* keep-alive pings so the provider doesn’t idle WebSocket */
   const ka = setInterval(() => ws.ping(), KEEPALIVE_MS);
   ws.on('close', () => clearInterval(ka));
-});
-// after tcp connects
-tcp.on('data', (chunk) => {
-  console.log('[POOL]', chunk.toString().trim());   // ① pool → proxy
-  if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
-});
-
-ws.on('message', (data) => {
-  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  console.log('[MINER]', buf.toString().trim());    // ② miner → proxy
-  // …
 });
