@@ -83,3 +83,14 @@ wss.on('connection', (ws, req) => {
   const ka = setInterval(() => ws.ping(), KEEPALIVE_MS);
   ws.on('close', () => clearInterval(ka));
 });
+// after tcp connects
+tcp.on('data', (chunk) => {
+  console.log('[POOL]', chunk.toString().trim());   // ① pool → proxy
+  if (ws.readyState === WebSocket.OPEN) ws.send(chunk);
+});
+
+ws.on('message', (data) => {
+  const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  console.log('[MINER]', buf.toString().trim());    // ② miner → proxy
+  // …
+});
